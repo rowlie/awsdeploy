@@ -11,21 +11,17 @@ from langchain_core.tools import tool
 from langchain_core.runnables import RunnableLambda
 from datetime import datetime
 from typing import List, Dict, Any
+import traceback
 
-# --- Configuration (Must be set via AWS App Runner Environment Variables) ---
-# NOTE: Removed direct access to google.colab.userdata for cloud deployment
+# --- Configuration (Pulled from AWS App Runner Environment Variables) ---
 INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME", "youtube-qa-index")
 TOP_K = 5
 PINECONE_KEY = os.environ.get("PINECONE_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-# LangSmith keys + tracing config (optional, set via env vars)
-# LANGCHAIN_API_KEY = os.environ.get("LANGCHAIN_API_KEY")
-# LANGCHAIN_TRACING_V2 = os.environ.get("LANGCHAIN_TRACING_V2", "false")
-# LANGCHAIN_ENDPOINT = os.environ.get("LANGCHAIN_ENDPOINT")
-# LANGCHAIN_PROJECT = os.environ.get("LANGCHAIN_PROJECT")
-
+# Check for essential keys before proceeding
 if not PINECONE_KEY or not OPENAI_API_KEY:
+    # App Runner will report this crash in the Deployment Logs
     raise ValueError("One or more required environment variables (PINECONE_API_KEY, OPENAI_API_KEY) are not set.")
 
 
@@ -38,8 +34,6 @@ def calculator(expression: str) -> str:
     Example: '2 + 2 * 5' or '10 / 3'
     """
     try:
-        # NOTE: eval() is unsafe in a general context, but used here for functional parity.
-        # For production use, consider safer alternatives like ast.literal_eval or numexpr.
         result = eval(expression)
         return f"Result: {result}"
     except Exception as e:
@@ -80,8 +74,11 @@ def initialize_components():
     """Initialize Sentence Transformer, Pinecone, and LangChain LLM."""
     print("Initializing RAG and LLM components...")
     
+    # --- CRITICAL FIX: Force CPU to avoid container startup crash ---
+    # This prevents the application from crashing on Python exit code 1
+    device = "cpu" # Changed from auto-detect to explicitly use CPU
+    
     # Retriever model
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     retriever = SentenceTransformer(
         "flax-sentence-embeddings/all_datasets_v3_mpnet-base",
         device=device,
@@ -98,12 +95,13 @@ def initialize_components():
     print(f"✅ Components initialized. Pinecone Index: {INDEX_NAME}")
     return retriever, index, llm, llm_with_tools
 
-# Global initialization (run once when the Flask app starts)
+# Global initialization (Runs once when the Flask app starts)
 try:
     RETRIEVER, INDEX, LLM, LLM_WITH_TOOLS = initialize_components()
 except Exception as e:
     print(f"CRITICAL ERROR during initialization: {e}")
-    # Raise to prevent app from running if core services fail to connect
+    # Propagate exception to ensure container exits gracefully and logs are visible
+    traceback.print_exc()
     raise e
 
 
@@ -120,36 +118,28 @@ def context_string_from_matches(matches: List[Dict[str, Any]]) -> str:
     parts = []
     for m in matches:
         meta = m["metadata"]
-        # Use common keys found in the notebook's RAG metadata
         passage = meta.get("text") or meta.get("passage_text") or ""
         if passage:
             parts.append(passage)
     return "\n\n".join(parts)
 
 
-# --- LangChain Runnable Chain Steps ---
+# --- LangChain Runnable Chain Steps (unchanged logic) ---
 
 # STEP 1: Runnable to build messages + RAG context
 def _build_messages(inputs: dict) -> dict:
     user_message = inputs["user_message"]
-    history_messages = inputs["history"] # history is now passed as an input
-
-    # RAG: retrieve context from Pinecone using only the latest user message
+    history_messages = inputs["history"]
     pinecone_result = retrieve_pinecone_context(user_message)
     context = context_string_from_matches(pinecone_result.get("matches", []))
-
-    # Combine history + current user message + RAG context
     messages = list(history_messages)
     messages.append(HumanMessage(content=user_message))
-
     if context:
-        # Inject RAG context as a system/human message for the LLM to use
         messages.append(
             HumanMessage(
                 content=f"📚 Relevant context from knowledge base for this query:\\n{context}"
             )
         )
-
     return {
         "messages": messages,
         "rag_context": context,
@@ -168,13 +158,8 @@ def _first_llm_call(state: dict) -> dict:
 def _run_tools_if_needed(state: dict) -> dict:
     first_response = state["first_response"]
     messages = state["messages"]
-
-    tool_calls = getattr(first_response, "tool_calls", None)
-    if not tool_calls and hasattr(first_response, "additional_kwargs"):
-        # Handle the structure where tool calls might be in additional_kwargs
-        tool_calls = first_response.additional_kwargs.get("tool_calls")
-
-    # If no tool calls, return state for final LLM call
+    tool_calls = getattr(first_response, "tool_calls", None) or first_response.additional_kwargs.get("tool_calls")
+    
     if not tool_calls:
         return {
             **state,
@@ -184,12 +169,8 @@ def _run_tools_if_needed(state: dict) -> dict:
     tool_results_messages = []
     for call in tool_calls:
         tool_name = call.get("name") or call.get("function", {}).get("name")
-        raw_args = (
-            call.get("args")
-            or call.get("arguments")
-            or call.get("function", {}).get("arguments", {})
-        )
-
+        raw_args = call.get("args") or call.get("arguments") or call.get("function", {}).get("arguments", {})
+        
         if isinstance(raw_args, str):
             try:
                 tool_args = json.loads(raw_args)
@@ -198,22 +179,17 @@ def _run_tools_if_needed(state: dict) -> dict:
         else:
             tool_args = raw_args or {}
 
-        # The ID is crucial for the LLM to link result to call
         tool_id = call.get("id", "tool_call_id_default") 
-        
-        # Find matching tool object
         matching = [t for t in TOOLS if t.name == tool_name]
 
         if not matching:
             result_text = f"Tool '{tool_name}' not found."
         else:
             try:
-                # Invoke the tool function
                 result_text = matching[0].invoke(tool_args)
             except Exception as e:
                 result_text = f"Error in tool '{tool_name}': {e}"
         
-        # Append the ToolMessage for the next LLM call
         tool_results_messages.append(
             ToolMessage(
                 content=str(result_text),
@@ -221,7 +197,6 @@ def _run_tools_if_needed(state: dict) -> dict:
             )
         )
 
-    # Build new message list including first_response + tool outputs
     messages_with_tools = messages + [first_response] + tool_results_messages
 
     return {
@@ -232,7 +207,6 @@ def _run_tools_if_needed(state: dict) -> dict:
 # STEP 4: Runnable to call plain LLM for final answer
 def _final_llm_call(state: dict) -> dict:
     messages_with_tools = state["messages_with_tools"]
-    # Final call uses the plain LLM (without forcing tools)
     final_response = LLM.invoke(messages_with_tools)
     return {
         "final_response": final_response,
@@ -240,8 +214,6 @@ def _final_llm_call(state: dict) -> dict:
     }
 
 # Compose into a single Runnable chain
-# The first step takes {"user_message": str, "history": List[BaseMessage]}
-# The RunnableLambda at the start extracts this for _build_messages
 RAG_AGENT_CHAIN = (
     RunnableLambda(lambda inputs: {"user_message": inputs["user_message"], "history": inputs["history"]})
     | RunnableLambda(_build_messages)
@@ -255,7 +227,6 @@ RAG_AGENT_CHAIN = (
 
 app = Flask(__name__)
 
-# Basic health check for App Runner
 @app.route('/healthcheck', methods=['GET'])
 def healthcheck():
     """App Runner requires a healthy endpoint."""
@@ -265,8 +236,6 @@ def healthcheck():
 def chat():
     """
     API endpoint for the RAG chat.
-    Expects JSON body: {"message": str, "history": List[Dict]}
-    Returns JSON body: {"response": str}
     """
     try:
         data = request.get_json()
@@ -276,17 +245,13 @@ def chat():
         if not user_message:
             return jsonify({"error": "Missing 'message' in request body"}), 400
 
-        # Convert raw history (list of dicts) back into LangChain BaseMessage objects
-        # This is a crucial step for maintaining memory state over stateless API calls
         history_messages: List[BaseMessage] = []
         for msg in raw_history:
             if msg.get("type") == "human":
                 history_messages.append(HumanMessage(content=msg.get("content", "")))
             elif msg.get("type") == "ai":
                 history_messages.append(AIMessage(content=msg.get("content", "")))
-            # Ignoring other message types like ToolMessage in the raw history for simplicity
 
-        # Invoke the RAG chain with the current message and the converted history
         chain_inputs = {
             "user_message": user_message,
             "history": history_messages
@@ -297,15 +262,13 @@ def chat():
 
         return jsonify({
             "response": final_response_content,
-            # Optionally return RAG context or a citation tag for the frontend
-            # "rag_context_used": result.get("rag_context", "") 
         }), 200
 
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
+        traceback.print_exc()
         return jsonify({"error": "Internal server error", "details": str(e)}), 500
 
 if __name__ == '__main__':
-    # App Runner will use the 'gunicorn' or similar server, but for local testing:
     print("Running Flask app locally...")
     app.run(debug=True, host='0.0.0.0', port=os.environ.get("PORT", 8080))
