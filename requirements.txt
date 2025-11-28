@@ -4,4 +4,5 @@ langchain-core
 sentence-transformers
 pinecone-client
 openai
-torch
+# --- CRITICAL FIX: Install PyTorch CPU-only version ---
+torch --index-url https://download.pytorch.org/whl/cpu
