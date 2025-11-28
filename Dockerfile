@@ -8,7 +8,7 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install all dependencies including gunicorn
-# We use a single RUN command to install all packages at once
+# We use a single RUN command to ensure all packages are installed together.
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir gunicorn && \
     pip install --no-cache-dir -r requirements.txt
@@ -22,6 +22,6 @@ EXPOSE 8080
 # Define environment variable for the port
 ENV PORT 8080
 
-# --- CRITICAL FIX HERE: Using shell form (single string) for better PATH discovery ---
-# This ensures gunicorn is found and executed correctly.
-CMD gunicorn --bind 0.0.0.0:8080 --workers 2 --threads 4 --timeout 120 app:app
+# CRITICAL: The CMD line is REMOVED. 
+# We rely entirely on the Start Command defined in the AWS console
+# (gunicorn --bind 0.0.0.0:8080 ... app:app) to launch the service.
