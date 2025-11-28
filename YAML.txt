@@ -2,10 +2,9 @@ version: 1.0
 runtime: python311
 build:
   commands:
-    # Use pip3 to install all required dependencies
     - pip3 install --no-cache-dir -r requirements.txt
 run:
-  # The Start command from your current settings
-  command: uvicorn app:app --host 0.0.0.0 --port 8080
+  # FIX: Running uvicorn as a module
+  command: python3 -m uvicorn app:app --host 0.0.0.0 --port 8080
   network:
     port: 8080
