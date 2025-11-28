@@ -1,0 +1,7 @@
+Flask
+langchain-openai
+langchain-core
+sentence-transformers
+pinecone-client
+openai
+torch
